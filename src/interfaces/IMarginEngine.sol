@@ -43,6 +43,4 @@ interface IMarginEngine {
     ) external returns (uint8 collateralId, uint80 amountToPay);
 
     function settleAtExpiry(address _subAccount) external;
-
-    function getPayout(uint256 tokenId, uint64 amount) external view returns (address collateral, uint256 payout);
 }

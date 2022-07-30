@@ -15,6 +15,7 @@ import {IMarginEngine} from "../../interfaces/IMarginEngine.sol";
 
 // librarise
 import {TokenIdUtil} from "../../libraries/TokenIdUtil.sol";
+import {NumberUtil} from "../../libraries/NumberUtil.sol";
 import {SimpleMarginMath} from "./libraries/SimpleMarginMath.sol";
 import {SimpleMarginLib} from "./libraries/SimpleMarginLib.sol";
 
@@ -37,6 +38,7 @@ contract SimpleMarginEngine is IMarginEngine, Ownable {
     using SimpleMarginLib for Account;
     using SafeERC20 for IERC20;
     using FixedPointMathLib for uint256;
+    using NumberUtil for uint256;
 
     IGrappa public immutable grappa;
     IOracle public immutable oracle;
@@ -205,55 +207,6 @@ contract SimpleMarginEngine is IMarginEngine, Ownable {
         emit ProductConfigurationUpdated(_productId, _dUpper, _dLower, _rUpper, _rLower, _volMultiplier);
     }
 
-    /**
-     * @dev calculate the payout for an expired option token
-     *
-     * @param _tokenId  token id of option token
-     * @param _amount   amount to settle
-     *
-     * @return collateral asset to settle in
-     * @return payout amount paid
-     **/
-    function getPayout(uint256 _tokenId, uint64 _amount) public view returns (address, uint256 payout) {
-        (TokenType tokenType, uint32 productId, uint64 expiry, uint64 longStrike, uint64 shortStrike) = TokenIdUtil
-            .parseTokenId(_tokenId);
-
-        if (block.timestamp < expiry) revert MA_NotExpired();
-
-        ProductAssets memory product = _getProductAssets(productId);
-
-        // cash value denominated in strike (usually USD), with {UNIT_DECIMALS} decimals
-        uint256 cashValue;
-
-        // expiry price of underlying, denominated in strike (usually USD), with {UNIT_DECIMALS} decimals
-        uint256 expiryPrice = oracle.getPriceAtExpiry(product.underlying, product.strike, expiry);
-
-        if (tokenType == TokenType.CALL) {
-            cashValue = SimpleMarginMath.getCallCashValue(expiryPrice, longStrike);
-        } else if (tokenType == TokenType.CALL_SPREAD) {
-            cashValue = SimpleMarginMath.getCashValueCallDebitSpread(expiryPrice, longStrike, shortStrike);
-        } else if (tokenType == TokenType.PUT) {
-            cashValue = SimpleMarginMath.getPutCashValue(expiryPrice, longStrike);
-        } else if (tokenType == TokenType.PUT_SPREAD) {
-            cashValue = SimpleMarginMath.getCashValuePutDebitSpread(expiryPrice, longStrike, shortStrike);
-        }
-
-        // payout is denominated in strike asset (usually USD), with {UNIT_DECIMALS} decimals
-        payout = cashValue.mulDivDown(_amount, UNIT);
-
-        // the following logic convert payout amount if collateral is not strike:
-        if (product.collateral == product.underlying) {
-            // collateral is underlying. payout should be devided by underlying price
-            payout = payout.mulDivDown(UNIT, expiryPrice);
-        } else if (product.collateral != product.strike) {
-            // collateral is not underlying nor strike
-            uint256 collateralPrice = oracle.getPriceAtExpiry(product.collateral, product.strike, expiry);
-            payout = payout.mulDivDown(UNIT, collateralPrice);
-        }
-
-        return (product.collateral, _convertDecimals(payout, UNIT_DECIMALS, product.collateralDecimals));
-    }
-
     /** ========================================================= **
      *                 * -------------------- *                    *
      *                 |  Actions  Functions  |                    *
@@ -418,7 +371,7 @@ contract SimpleMarginEngine is IMarginEngine, Ownable {
             productParams[detail.productId]
         );
 
-        minCollateral = _convertDecimals(minCollateralInUnit, UNIT_DECIMALS, product.collateralDecimals);
+        minCollateral = minCollateralInUnit.convertDecimals(UNIT_DECIMALS, product.collateralDecimals);
     }
 
     /**
@@ -428,8 +381,9 @@ contract SimpleMarginEngine is IMarginEngine, Ownable {
      */
     function _getPayoutFromAccount(Account memory _account) internal view returns (uint80 reservedPayout) {
         (uint256 callPayout, uint256 putPayout) = (0, 0);
-        if (_account.shortCallAmount > 0) (, callPayout) = getPayout(_account.shortCallId, _account.shortCallAmount);
-        if (_account.shortPutAmount > 0) (, putPayout) = getPayout(_account.shortPutId, _account.shortPutAmount);
+        if (_account.shortCallAmount > 0)
+            (, callPayout) = grappa.getPayout(_account.shortCallId, _account.shortCallAmount);
+        if (_account.shortPutAmount > 0) (, putPayout) = grappa.getPayout(_account.shortPutId, _account.shortPutAmount);
         return uint80(callPayout + putPayout);
     }
 
@@ -486,36 +440,5 @@ contract SimpleMarginEngine is IMarginEngine, Ownable {
         info.strike = strike;
         info.collateral = collateral;
         info.collateralDecimals = collatDecimals;
-    }
-
-    /**
-     * @notice convert decimals
-     *
-     * @param  _amount      number to convert
-     * @param _fromDecimals the decimals _amount has
-     * @param _toDecimals   the target decimals
-     *
-     * @return _ number with _toDecimals decimals
-     */
-    function _convertDecimals(
-        uint256 _amount,
-        uint8 _fromDecimals,
-        uint8 _toDecimals
-    ) internal pure returns (uint256) {
-        if (_fromDecimals == _toDecimals) return _amount;
-
-        if (_fromDecimals > _toDecimals) {
-            uint8 diff;
-            unchecked {
-                diff = _fromDecimals - _toDecimals;
-            }
-            return _amount / (10**diff);
-        } else {
-            uint8 diff;
-            unchecked {
-                diff = _toDecimals - _fromDecimals;
-            }
-            return _amount * (10**diff);
-        }
     }
 }

@@ -18,6 +18,7 @@ import {Registry} from "./Registry.sol";
 // librarise
 import {TokenIdUtil} from "../libraries/TokenIdUtil.sol";
 import {ProductIdUtil} from "../libraries/ProductIdUtil.sol";
+import {NumberUtil} from "../libraries/NumberUtil.sol";
 import {SimpleMarginMath} from "./engines/libraries/SimpleMarginMath.sol";
 import {SimpleMarginLib} from "./engines/libraries/SimpleMarginLib.sol";
 
@@ -38,6 +39,8 @@ contract Grappa is ReentrancyGuard, Registry {
     using SimpleMarginMath for SimpleMarginDetail;
     using SimpleMarginLib for Account;
     using SafeERC20 for IERC20;
+    using FixedPointMathLib for uint256;
+    using NumberUtil for uint256;
 
     ///@dev maskedAccount => operator => authorized
     ///     every account can authorize any amount of addresses to modify all sub-accounts he controls.
@@ -46,10 +49,16 @@ contract Grappa is ReentrancyGuard, Registry {
     /// @dev optionToken address
     IOptionToken public immutable optionToken;
     IMarginEngine public immutable engine;
+    IOracle public immutable oracle;
 
-    constructor(address _optionToken, address _engine) {
+    constructor(
+        address _optionToken,
+        address _engine,
+        address _oracle
+    ) {
         optionToken = IOptionToken(_optionToken);
         engine = IMarginEngine(_engine);
+        oracle = IOracle(_oracle);
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -123,7 +132,7 @@ contract Grappa is ReentrancyGuard, Registry {
         uint256 _tokenId,
         uint256 _amount
     ) external {
-        (address collateral, uint256 payout) = engine.getPayout(_tokenId, uint64(_amount));
+        (address collateral, uint256 payout) = getPayout(_tokenId, uint64(_amount));
 
         optionToken.burn(_account, _tokenId, _amount);
 
@@ -149,7 +158,7 @@ contract Grappa is ReentrancyGuard, Registry {
         uint256 totalPayout;
 
         for (uint256 i; i < _tokenIds.length; ) {
-            (address collateral, uint256 payout) = engine.getPayout(_tokenIds[i], uint64(_amounts[i]));
+            (address collateral, uint256 payout) = getPayout(_tokenIds[i], uint64(_amounts[i]));
 
             if (collateral != _collateral) revert ST_WrongSettlementCollateral();
             totalPayout += payout;
@@ -162,6 +171,57 @@ contract Grappa is ReentrancyGuard, Registry {
         optionToken.batchBurn(_account, _tokenIds, _amounts);
 
         IERC20(_collateral).safeTransfer(_account, totalPayout);
+    }
+
+    /**
+     * @dev calculate the payout for an expired option token
+     *
+     * @param _tokenId  token id of option token
+     * @param _amount   amount to settle
+     *
+     * @return collateral asset to settle in
+     * @return payout amount paid
+     **/
+    function getPayout(uint256 _tokenId, uint64 _amount) public view returns (address, uint256 payout) {
+        (TokenType tokenType, uint32 productId, uint64 expiry, uint64 longStrike, uint64 shortStrike) = TokenIdUtil
+            .parseTokenId(_tokenId);
+
+        if (block.timestamp < expiry) revert MA_NotExpired();
+
+        (address underlying, address strike, address collateral, uint8 collateralDecimals) = getAssetsFromProductId(
+            productId
+        );
+
+        // cash value denominated in strike (usually USD), with {UNIT_DECIMALS} decimals
+        uint256 cashValue;
+
+        // expiry price of underlying, denominated in strike (usually USD), with {UNIT_DECIMALS} decimals
+        uint256 expiryPrice = oracle.getPriceAtExpiry(underlying, strike, expiry);
+
+        if (tokenType == TokenType.CALL) {
+            cashValue = SimpleMarginMath.getCallCashValue(expiryPrice, longStrike);
+        } else if (tokenType == TokenType.CALL_SPREAD) {
+            cashValue = SimpleMarginMath.getCashValueCallDebitSpread(expiryPrice, longStrike, shortStrike);
+        } else if (tokenType == TokenType.PUT) {
+            cashValue = SimpleMarginMath.getPutCashValue(expiryPrice, longStrike);
+        } else if (tokenType == TokenType.PUT_SPREAD) {
+            cashValue = SimpleMarginMath.getCashValuePutDebitSpread(expiryPrice, longStrike, shortStrike);
+        }
+
+        // payout is denominated in strike asset (usually USD), with {UNIT_DECIMALS} decimals
+        payout = cashValue.mulDivDown(_amount, UNIT);
+
+        // the following logic convert payout amount if collateral is not strike:
+        if (collateral == underlying) {
+            // collateral is underlying. payout should be devided by underlying price
+            payout = payout.mulDivDown(UNIT, expiryPrice);
+        } else if (collateral != strike) {
+            // collateral is not underlying nor strike
+            uint256 collateralPrice = oracle.getPriceAtExpiry(collateral, strike, expiry);
+            payout = payout.mulDivDown(UNIT, collateralPrice);
+        }
+
+        return (collateral, payout.convertDecimals(UNIT_DECIMALS, collateralDecimals));
     }
 
     /**

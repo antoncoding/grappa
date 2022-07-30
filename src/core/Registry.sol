@@ -43,7 +43,7 @@ contract Registry is Ownable {
      * @param _productId product id
      */
     function getAssetsFromProductId(uint32 _productId)
-        external
+        public
         view
         returns (
             address underlying,

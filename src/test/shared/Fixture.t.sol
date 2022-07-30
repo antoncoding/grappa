@@ -56,7 +56,7 @@ abstract contract Fixture is Test, ActionHelper, Utilities {
 
         address marginEngineAddr = predictAddress(address(this), 6);
 
-        grappa = new Grappa(address(option), marginEngineAddr); // nonce: 5
+        grappa = new Grappa(address(option), marginEngineAddr, address(oracle)); // nonce: 5
 
         marginEngine = new SimpleMarginEngine(address(grappa), address(oracle)); // nonce 5
 
